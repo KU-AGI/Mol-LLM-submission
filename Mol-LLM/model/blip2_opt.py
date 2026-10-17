@@ -220,6 +220,7 @@ class Blip2OPT(Blip2Base):
         self.llm_tokenizer = AutoTokenizer.from_pretrained(
             # llm_model, use_fast=False, padding_side="right"
             llm_model,
+            revision=getattr(args, "llm_revision", None),
             use_fast=False,
             padding_side="left",
         )
@@ -227,9 +228,20 @@ class Blip2OPT(Blip2Base):
 
         self.set_llm_model(llm_model)
 
+        if getattr(args, 'sequence_length_policy', 'legacy') == 'full_preserve':
+            declared = int(args.sequence_context_limit)
+            actual = int(self.llm_model.config.max_position_embeddings)
+            if declared > actual:
+                raise ValueError(f'sequence_context_limit={declared} exceeds model limit {actual}')
+
+        n_old_vocab = self.llm_model.get_input_embeddings().weight.shape[0]
         self.llm_model.resize_token_embeddings(
             len(self.llm_tokenizer)
         )  # this will cause bug when full fine-tuning the opt model
+        self.n_added_tokens = (
+            self.llm_model.get_input_embeddings().weight.shape[0] - n_old_vocab
+        )
+
 
         self.tune_llm = tune_llm
         if tune_llm == "lora":
@@ -262,8 +274,27 @@ class Blip2OPT(Blip2Base):
         else:
             raise NotImplementedError()
 
+
+        _lg = bool(getattr(args, "label_gather_loss", False))
+        _mids = list(getattr(self.llm_tokenizer, "molpo_mask_ids", []) or [])
+        _n_set = 0
+        for _m in self.llm_model.modules():
+            if type(_m).__name__.endswith("ForCausalLM_custom"):
+                _m.label_gather_loss = _lg
+
+
+                _m.molpo_mask_ids = _mids
+                _n_set += 1
+        print(f"label_gather_loss={_lg} set on {_n_set} causal-LM module(s); "
+              f"molpo_mask_ids={len(_mids)}", flush=True)
+
         self.set_params_requires_grads(
             model=self.llm_model, keyword="embed", grad=True, IsPrint=False
+        )
+
+
+        self.set_params_requires_grads(
+            model=self.llm_model, keyword="lm_head", grad=True, IsPrint=False
         )
 
         if self.args.llava_pretraining:
@@ -291,6 +322,7 @@ class Blip2OPT(Blip2Base):
                     gnn_hidden_dim,
                     cross_attention_freq,
                     bert_num_hidden_layers=args.bert_num_hidden_layers,
+                    revision=getattr(args, "bert_revision", None),
                 )
 
                 ## remove the unused parameters
@@ -425,10 +457,13 @@ class Blip2OPT(Blip2Base):
 
     def forward(self, batch):
         input_ids = batch.input_ids  # ['input_ids']
-        attention_mask = batch.attention_mask  # ['attention_mask']
         target_ids = batch.labels  # ['labels']
 
-        # preprare targets to ignore pad tokens in the loss calculation
+
+        attention_mask = batch.get("attention_mask", None)
+        position_ids = batch.get("position_ids", None)
+
+
         targets = target_ids.masked_fill(
             target_ids == self.llm_tokenizer.pad_token_id, -100
         )
@@ -445,34 +480,45 @@ class Blip2OPT(Blip2Base):
                     is_mol_token=is_mol_token,
                     # graphs=graphs,
                     graphs=(graphs, additional_graphs),
+                    position_ids=position_ids,
                 )
             )
 
             outputs = self.llm_model(
                 inputs_embeds=input_embeds,
                 attention_mask=attention_mask,
+                position_ids=position_ids,
                 return_dict=True,
                 labels=targets,
             )
             results = {
                 "loss": outputs.loss,
                 "instance_loss": outputs.instance_loss,
+                "instance_loss_molpo": getattr(outputs, "instance_loss_molpo", None),
                 "logits": outputs.logits,
                 "graph_avg_norm": graph_avg_norm,
                 "moltoken_avg_norm": moltoken_avg_norm,
+
+
+                "gathered_logps": getattr(outputs, "gathered_logps", None),
+                "gathered_selected": getattr(outputs, "gathered_selected", None),
             }
 
         else:
             outputs = self.llm_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                position_ids=position_ids,
                 return_dict=True,
                 labels=targets,
             )
             results = {
                 "loss": outputs.loss,
                 "instance_loss": outputs.instance_loss,
+                "instance_loss_molpo": getattr(outputs, "instance_loss_molpo", None),
                 "logits": outputs.logits,
+                "gathered_logps": getattr(outputs, "gathered_logps", None),
+                "gathered_selected": getattr(outputs, "gathered_selected", None),
             }
 
         return results
@@ -496,12 +542,28 @@ class Blip2OPT(Blip2Base):
             labels.append(label)
         return predictions, labels
 
-    def inject_graph_embeds2input_embeds(self, input_embeds, is_mol_token, graphs):
+    def inject_graph_embeds2input_embeds(
+        self, input_embeds, is_mol_token, graphs, position_ids=None
+    ):
         mol_graphs, mol2_graphs = graphs
+
+
+        if position_ids is not None and is_mol_token.size(0) == 1 and bool(
+            (position_ids[0, 1:] - position_ids[0, :-1] < 0).any()
+        ):
+            _seg = torch.cumsum((position_ids[0] == 0).long(), dim=0) - 1
+            _tok = is_mol_token[0].nonzero(as_tuple=True)[0]
+            max_mol_tokens_needed = int(torch.bincount(_seg[_tok]).max()) if _tok.numel() else 0
+        else:
+            max_mol_tokens_needed = int(is_mol_token.sum(dim=1).max()) if is_mol_token.numel() else 0
 
         mol_token_sequence = []
 
-        for graphs in [mol_graphs, mol2_graphs]:
+        for graph_slot, graphs in enumerate([mol_graphs, mol2_graphs]):
+            if graph_slot == 1 and mol_token_sequence and (
+                max_mol_tokens_needed <= mol_token_sequence[0].size(1)
+            ):
+                break
 
             mol_x = graphs["x"]
             mol_edge_index = graphs["edge_index"]
@@ -539,14 +601,15 @@ class Blip2OPT(Blip2Base):
                     mol_x, mol_edge_index, mol_edge_attr, mol_batch
                 )
 
-            mol_embeds, mol_masks = self.graph_encoder(
-                mol_x, mol_edge_index, mol_edge_attr, mol_batch
-            )
+
             if not self.tune_gnn:
                 mol_embeds = mol_embeds.detach()
             mol_embeds = self.ln_graph(mol_embeds, mol_masks)
-            graph_embedding = mol_embeds[:, 0, :]
-            graph_avg_norm = torch.norm(graph_embedding, p=1, dim=-1)
+
+
+            if graph_slot == 0:
+                graph_embedding = mol_embeds[:, 0, :]
+                graph_avg_norm = torch.norm(graph_embedding, p=1, dim=-1)
 
             if self.args.projector_type == "qformer":
                 query_tokens = self.query_tokens.expand(mol_embeds.shape[0], -1, -1)
@@ -561,27 +624,56 @@ class Blip2OPT(Blip2Base):
                 mol_tokens = self.opt_proj(mol_embeds)
             mol_token_sequence.append(mol_tokens)
 
-            mol_tokens = torch.cat(mol_token_sequence, dim=1)
-            moltoken_avg_norm = torch.norm(mol_tokens, p=1, dim=-1).mean(1)
+
+        mol_tokens = torch.cat(mol_token_sequence, dim=1)
+        moltoken_avg_norm = torch.norm(mol_tokens, p=1, dim=-1).mean(1)
 
         num_mol_tokens_per_sample = is_mol_token.sum(dim=1)  # Shape: (batch_size,)
         if (num_mol_tokens_per_sample > 0).any():
-            mol_token_indices_full = (
-                is_mol_token.cumsum(dim=1) - 1
-            )  # Shape: (batch_size, seq_length)
+            if position_ids is not None and is_mol_token.size(0) == 1 and bool(
+                (position_ids[0, 1:] - position_ids[0, :-1] < 0).any()
+            ):
 
-            # Get indices where is_mol_token is True
-            batch_indices, token_indices = is_mol_token.nonzero(
-                as_tuple=True
-            )  # Shape: (num_true_tokens,)
 
-            # Get corresponding mol_token_indices
-            mol_token_indices = mol_token_indices_full[
-                batch_indices, token_indices
-            ]  # Shape: (num_true_tokens,)
-            input_embeds[batch_indices, token_indices, :] = mol_tokens[
-                batch_indices, mol_token_indices, :
-            ]
+                segment_of_position = (
+                    torch.cumsum((position_ids[0] == 0).long(), dim=0) - 1
+                )
+                token_indices = is_mol_token[0].nonzero(as_tuple=True)[0]
+                instance_indices = segment_of_position[token_indices]
+
+
+                counts = torch.bincount(
+                    instance_indices, minlength=mol_tokens.size(0)
+                )
+                offsets = torch.cumsum(counts, dim=0) - counts
+                within_instance = (
+                    torch.arange(token_indices.numel(), device=token_indices.device)
+                    - offsets[instance_indices]
+                )
+                assert int(counts.max()) <= mol_tokens.size(1), (
+                    f"an instance carries {int(counts.max())} <mol> tokens but only "
+                    f"{mol_tokens.size(1)} graph tokens were produced for it"
+                )
+                input_embeds[0, token_indices, :] = mol_tokens[
+                    instance_indices, within_instance, :
+                ]
+            else:
+                mol_token_indices_full = (
+                    is_mol_token.cumsum(dim=1) - 1
+                )
+
+
+                batch_indices, token_indices = is_mol_token.nonzero(
+                    as_tuple=True
+                )
+
+
+                mol_token_indices = mol_token_indices_full[
+                    batch_indices, token_indices
+                ]
+                input_embeds[batch_indices, token_indices, :] = mol_tokens[
+                    batch_indices, mol_token_indices, :
+                ]
 
         return input_embeds, graph_avg_norm, moltoken_avg_norm
 

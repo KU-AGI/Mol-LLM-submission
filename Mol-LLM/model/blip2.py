@@ -25,12 +25,12 @@ from collections import OrderedDict
 
 class Blip2Base(BaseModel):
     @classmethod
-    def init_tokenizer(cls):
+    def init_tokenizer(cls, revision=None):
         if True:
             bert_name = "allenai/scibert_scivocab_uncased"
         else:
             bert_name = "bert_pretrained/"
-        tokenizer = BertTokenizer.from_pretrained(bert_name)
+        tokenizer = BertTokenizer.from_pretrained(bert_name, revision=revision)
         tokenizer.add_special_tokens({"bos_token": "[DEC]"})
         return tokenizer
 
@@ -52,6 +52,7 @@ class Blip2Base(BaseModel):
         graph_width,
         cross_attention_freq=2,
         bert_num_hidden_layers=-1,
+        revision=None,
     ):
         assert model_name == "scibert"
         print("bert load scibert")
@@ -60,7 +61,7 @@ class Blip2Base(BaseModel):
         else:
             bert_name = "bert_pretrained/"
 
-        encoder_config = BertConfig.from_pretrained(bert_name)
+        encoder_config = BertConfig.from_pretrained(bert_name, revision=revision)
         encoder_config.encoder_width = graph_width
         # insert cross-attention layer every other block
         encoder_config.add_cross_attention = True
@@ -69,7 +70,7 @@ class Blip2Base(BaseModel):
         if bert_num_hidden_layers > 0:
             encoder_config.num_hidden_layers = bert_num_hidden_layers
 
-        Qformer = BertLMHeadModel.from_pretrained(bert_name, config=encoder_config)
+        Qformer = BertLMHeadModel.from_pretrained(bert_name, config=encoder_config, revision=revision)
         query_tokens = nn.Parameter(
             torch.zeros(1, num_query_token, encoder_config.hidden_size)
         )
