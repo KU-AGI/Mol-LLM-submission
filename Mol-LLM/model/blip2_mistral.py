@@ -39,27 +39,44 @@ class Blip2Mistral(Blip2OPT):
     """
 
     def __init__(self, args):
+        from instructions_smol import validate_runtime_revision
+        validate_runtime_revision(getattr(args, "prompt_revision", None), getattr(args, "eval_molpo", False),
+                                  getattr(args, "eval_molpo_endpoint_matched_donors", False))
         super().__init__(args=args)
-        self.system_prompt = "You are a helpful assistant for molecular chemistry, to address tasks including molecular property classification, molecular property regression, chemical reaction prediction, molecule captioning, molecule generation."
+
+        self.system_prompt_mode = getattr(args, "system_prompt_mode", "legacy")
 
     def set_llm_model(self, llm_model):
-        self.llm_model = MistralForCausalLM_custom.from_pretrained(
-            llm_model, torch_dtype=torch.bfloat16
+
+
+        kwargs = {"torch_dtype": torch.bfloat16}
+        if getattr(self.args, "llm_revision", None):
+            kwargs["revision"] = self.args.llm_revision
+        attn_impl = getattr(self.args, "attn_implementation", None)
+        if getattr(self.args, "apply_sequence_packing", False) and attn_impl is None:
+            attn_impl = "flash_attention_2"
+        if attn_impl is not None:
+            kwargs["attn_implementation"] = attn_impl
+
+        self.llm_model = MistralForCausalLM_custom.from_pretrained(llm_model, **kwargs)
+        self.llm_model.label_gather_loss = getattr(
+            self.args, "label_gather_loss", False
         )
+
+        if attn_impl is not None:
+
+
+            actual = self.llm_model.model.config._attn_implementation
+            assert actual == attn_impl, (
+                f"requested attn_implementation={attn_impl} but the model was built "
+                f"with {actual}"
+            )
         return
 
     def fit_llm_input_convention(self, llm_prompt):
         if self.args.llm_model == "mistralai/Mistral-7B-Instruct-v0.3":
-            message = [
-                {
-                    "role": "system",
-                    "content": self.system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": llm_prompt,
-                },
-            ]
+            from instructions_smol import chat_messages
+            message = chat_messages(llm_prompt, self.system_prompt_mode)
             formatted_ids = self.llm_tokenizer.apply_chat_template(conversation=message)
             formatted_text = self.llm_tokenizer.decode(
                 formatted_ids,
@@ -95,6 +112,30 @@ from transformers.models.mistral.modeling_mistral import (
 
 logger = logging.get_logger(__name__)
 
+def _is_packed(position_ids):
+    return (
+        position_ids is not None
+        and position_ids.size(0) == 1
+        and bool((position_ids[0, 1:] - position_ids[0, :-1] < 0).any())
+    )
+
+def _instance_loss(token_loss, selected, position_ids):
+    if _is_packed(position_ids):
+
+        segment_of_position = torch.cumsum((position_ids[0] == 0).long(), dim=0) - 1
+        index = segment_of_position[1:][selected[0]]
+        n_instances = int(segment_of_position[-1]) + 1
+    else:
+        rows = torch.arange(selected.size(0), device=selected.device)
+        index = rows.unsqueeze(1).expand_as(selected)[selected]
+        n_instances = selected.size(0)
+
+    totals = torch.zeros(n_instances, dtype=token_loss.dtype, device=token_loss.device)
+    counts = torch.zeros_like(totals)
+    totals.index_add_(0, index, token_loss)
+    counts.index_add_(0, index, torch.ones_like(token_loss))
+
+    return totals / counts
 
 class MistralForCausalLM_custom(MistralForCausalLM):
     def __init__(self, config):
@@ -184,11 +225,36 @@ class MistralForCausalLM_custom(MistralForCausalLM):
             logger.warning_once(
                 "Starting from v4.46, the `logits` model output will have the same type as the model (except at train time, where it will always be FP32)"
             )
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        # TODO: remove the float() operation in v4.46
+        _lg_flag = getattr(self, 'label_gather_loss', False)
+        if labels is not None and _lg_flag and torch.is_grad_enabled():
+            shift_hidden = hidden_states[:, :-1, :]
+            shift_labels = labels[:, 1:]
+            selected = shift_labels != -100
+            loss_not_reduced = CrossEntropyLoss(reduction='none')(
+                self.lm_head(shift_hidden[selected]).float(), shift_labels[selected]
+            )
+            loss_sum = loss_not_reduced.sum()
+            label_token_count = selected.sum()
+            loss = loss_sum / label_token_count.clamp(min=1)
+            instance_loss = _instance_loss(loss_not_reduced, selected, position_ids)
+            if not return_dict:
+                return (loss, None) + outputs[1:]
+            return CausalLMOutputWithPast_Custom(
+                loss=loss,
+                loss_sum=loss_sum,
+                label_token_count=label_token_count,
+                logits=None,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                instance_loss=instance_loss,
+                gathered_logps=-loss_not_reduced,
+                gathered_selected=selected,
+            )
         logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :]).float()
 
         loss = None
+        loss_sum = label_token_count = None
         if labels is not None:
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
@@ -213,25 +279,43 @@ class MistralForCausalLM_custom(MistralForCausalLM):
             instance_loss = (loss_not_reduced * instance_non_pad_tokens).sum(
                 dim=-1
             ) / instance_non_pad_tokens.sum(dim=-1)
-
-            # cross entropy aggregate not row-wise, but sum of all instances
-            loss = (
-                loss_not_reduced * instance_non_pad_tokens
-            ).sum() / instance_non_pad_tokens.sum()
+            if _is_packed(position_ids):
+                selected = instance_non_pad_tokens.bool()
+                instance_loss = _instance_loss(loss_not_reduced[selected], selected, position_ids)
+            instance_loss_molpo = None
+            _mids = getattr(self, 'molpo_mask_ids', None)
+            if _mids:
+                _sl = shift_labels.view(labels.size(0), -1)
+                molpo_keep = instance_non_pad_tokens.clone()
+                for _mid in _mids:
+                    molpo_keep = molpo_keep * (_sl != _mid).to(molpo_keep.dtype)
+                if _is_packed(position_ids):
+                    _sel_m = molpo_keep.bool()
+                    instance_loss_molpo = _instance_loss(loss_not_reduced[_sel_m], _sel_m, position_ids)
+                else:
+                    _den = molpo_keep.sum(dim=-1)
+                    instance_loss_molpo = (loss_not_reduced * molpo_keep).sum(dim=-1) / _den.clamp(min=1)
+                    instance_loss_molpo = instance_loss_molpo.masked_fill(_den == 0, float('nan'))
+            loss_sum = (loss_not_reduced * instance_non_pad_tokens).sum()
+            label_token_count = instance_non_pad_tokens.sum()
+            loss = loss_sum / label_token_count.clamp(min=1)
         else:
             instance_loss = None
-
+            instance_loss_molpo = None
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
         return CausalLMOutputWithPast_Custom(
             loss=loss,
+            loss_sum=loss_sum,
+            label_token_count=label_token_count,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             instance_loss=instance_loss,
+            instance_loss_molpo=instance_loss_molpo,
         )
 
 
@@ -270,3 +354,13 @@ class CausalLMOutputWithPast_Custom(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     instance_loss: Optional[torch.FloatTensor] = None
+
+
+    instance_loss_molpo: Optional[torch.FloatTensor] = None
+
+
+    gathered_logps: Optional[torch.FloatTensor] = None
+    gathered_selected: Optional[torch.BoolTensor] = None
+
+    loss_sum: Optional[torch.FloatTensor] = None
+    label_token_count: Optional[torch.LongTensor] = None

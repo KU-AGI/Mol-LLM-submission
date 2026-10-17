@@ -1,0 +1,30 @@
+defaults:
+  - gnn: gine_tokengt
+  - trainer: revision_molpo
+  - _self_
+
+filename: molpo-s${seed}
+seed: 42
+mode: ft
+wandb_entity: null
+wandb_project: mol-llm
+wandb_id: null
+debug: false
+ckpt_path: null
+pretrained_ckpt_path: ${oc.env:MOLLLM_STAGE2_CHECKPOINT}
+shuffle_selfies: false
+shuffle_graph: false
+process_disjoint: true
+system_prompt_mode: none
+prompt_revision: tdc-species-nosystem-v1
+sequence_length_policy: full_preserve
+sequence_context_limit: 32768
+split_paths:
+  train: ${oc.env:MOLLLM_TRAIN}
+  validation: ${oc.env:MOLLLM_VALIDATION}
+  test: ${oc.env:MOLLLM_TEST}
+gnn:
+  gine:
+    graph_encoder_ckpt: ${oc.env:MOLLLM_GINE_CHECKPOINT}
+  tokengt:
+    graph_encoder_ckpt: ${oc.env:MOLLLM_TOKENGT_CHECKPOINT}

@@ -924,44 +924,5 @@ def map_by_substructure_replacement(
 
 
 if __name__ == "__main__":
-    import argparse
-    import os
-    import random
-
-    # get arg replace_ratio, dataset_path
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--replace_ratio", type=float, default=0.3)
-    parser.add_argument("--data_dir", type=str, default="/data/data/Mol-LLM-v7.1")
-    parser.add_argument(
-        "--dataset_path",
-        type=str,
-        default="mistralai-Mistral-7B-Instruct-v0.3_string+graph_q32_test_3.3M_0415",
-    )
-    parser.add_argument("--num_procs", type=int, default=10)
-    parser.add_argument("--num_rejected_graphs", type=int, default=6)
-    parser.add_argument("--data_tag", type=str, default="")
-
-    args = parser.parse_args()
-
-    dataset_path = os.path.join(args.data_dir, args.dataset_path)
-    dataset = load_from_disk(dataset_path)
-
-    from functools import partial
-
-    map_by_substructure_replacement = partial(
-        map_by_substructure_replacement,
-        replace_ratio=args.replace_ratio,
-        num_rejected_graphs=args.num_rejected_graphs,
-    )
-
-    random.seed(42)
-    mapped_dataset = dataset.map(
-        map_by_substructure_replacement, batched=False, num_proc=args.num_procs
-    )
-    mapped_dataset.save_to_disk(
-        dataset_path + "_" + f"molpo-replace-{args.replace_ratio}" + args.data_tag
-    )
-    print(
-        "saved augmented dataset:",
-        dataset_path + f"molpo-replace-{args.replace_ratio}" + args.data_tag,
-    )
+    from data.builders.hard_negative.__main__ import main
+    main()

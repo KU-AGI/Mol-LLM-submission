@@ -659,3 +659,144 @@ property_prediction_lipo = [
     "Provide the logD (the octanol/water distribution coefficient) at pH 7.4 of <INPUT> .",
     "<INPUT> Please predict the octanol/water distribution coefficient (logD at pH 7.4) for the molecule given above.",
 ]
+
+
+TDC_TEMPLATES = {
+    "ppbr_az": [
+        "What is the human plasma protein binding rate of <INPUT>, as a percentage?",
+        "Please predict what percentage of <INPUT> is bound to plasma proteins in humans.",
+        "Tell me the plasma protein binding rate of <INPUT>, in percent.",
+        "Could you provide the human plasma protein binding percentage for <INPUT>?",
+        "Give me the percentage of the following molecule that binds plasma protein: <INPUT>.",
+        "<INPUT> What is the plasma protein binding rate of the molecule given above?",
+        "Predict how strongly <INPUT> binds human plasma proteins, as a percentage.",
+        "Can you estimate the percentage of <INPUT> that is bound to plasma proteins?",
+        "<INPUT> Based on the molecule given above, suggest its human plasma protein binding rate.",
+        "For the molecule <INPUT>, what plasma protein binding percentage would you expect?",
+        "Propose a human plasma protein binding rate, as a percentage, for this molecule. <INPUT>",
+        "A molecule <INPUT> is given; what could its plasma protein binding rate be?",
+        "Using <INPUT> as the molecule, tell me its human plasma protein binding rate in percent.",
+    ],
+    "clearance_hepatocyte_az": [
+        "What is the base-10 logarithm of the hepatocyte clearance, in uL/min per million cells, of <INPUT>?",
+        "Please predict the base-10 logarithm of the drug clearance of <INPUT> in a human hepatocyte assay.",
+        "Tell me log10 of the hepatocyte clearance, in uL/min per million cells, measured for <INPUT>.",
+        "Could you provide the base-10 logarithm of the hepatocyte clearance in uL/min per million cells for <INPUT>?",
+        "Give me the base-10 logarithm of the human hepatocyte clearance for the following molecule: <INPUT>.",
+        "<INPUT> What is the base-10 logarithm of the hepatocyte clearance of the molecule given above?",
+        "Predict how fast hepatocytes clear <INPUT>, as the base-10 logarithm of its clearance.",
+        "Can you estimate the base-10 logarithm of the hepatocyte clearance of <INPUT>?",
+        "<INPUT> Based on the molecule given above, suggest the base-10 logarithm of its hepatocyte clearance.",
+        "For the molecule <INPUT>, what base-10 logarithm of hepatocyte clearance in uL/min per million cells would you expect?",
+        "Propose a value for the base-10 logarithm of the hepatocyte clearance of this molecule. <INPUT>",
+        "A molecule <INPUT> is given; what could the base-10 logarithm of its hepatocyte clearance be?",
+        "Using <INPUT> as the molecule, tell me the base-10 logarithm of its clearance in a human hepatocyte assay.",
+    ],
+}
+
+TDC_SPECIES_NAMES = {"Homo sapiens": "human", "Rattus norvegicus": "rat", "Canis lupus familiaris": "dog", "Mus musculus": "mouse", "Cavia porcellus": "guinea pig"}
+
+_TDC_REVISION_PPBR = (
+    "Predict plasma protein binding (%) of <INPUT> in {species} plasma.",
+    "What percentage of <INPUT> binds proteins in {species} plasma?",
+    "Give the plasma protein binding (%) of <INPUT> in {species} plasma.",
+    "Estimate plasma protein binding (%) for <INPUT> in {species} plasma.",
+    "Report protein binding in {species} plasma (%) for <INPUT>.",
+    "<INPUT> What is its protein binding in {species} plasma (%)?",
+    "Predict the percentage of <INPUT> bound to proteins in {species} plasma.",
+    "Estimate the protein-bound percentage of <INPUT> in {species} plasma.",
+    "<INPUT> Give its plasma protein binding (%) in {species} plasma.",
+    "For <INPUT>, predict protein binding in {species} plasma (%).",
+    "Provide the plasma protein binding percentage in {species} plasma for <INPUT>.",
+    "What is the protein-bound fraction of <INPUT> in {species} plasma, as a percentage?",
+    "For the molecule <INPUT>, report protein binding (%) in {species} plasma.",
+)
+
+_TDC_REVISION_HEP = (
+    "Predict log10 clearance for <INPUT> in {species} hepatocytes",
+    "Estimate log10 clearance of <INPUT> in {species} hepatocytes",
+    "Report log10 clearance for <INPUT> in {species} hepatocytes",
+    "What is log10 clearance of <INPUT> in {species} hepatocytes",
+    "Give log10 clearance for <INPUT> in {species} hepatocytes",
+    "<INPUT> Predict its log10 clearance in {species} hepatocytes",
+    "Predict log10 hepatocyte clearance in {species} for <INPUT>",
+    "Estimate log10 hepatocyte clearance in {species} for <INPUT>",
+    "<INPUT> Report its log10 clearance in {species} hepatocytes",
+    "For <INPUT>, give log10 clearance in {species} hepatocytes",
+    "Provide log10 clearance for <INPUT> in {species} hepatocytes",
+    "What log10 clearance is expected for <INPUT> in {species} hepatocytes",
+    "For the molecule <INPUT>, report log10 clearance in {species} hepatocytes",
+)
+
+_TDC_REVISION_HEP_MEASUREMENT = " at 37 C (uL/min/10^6 cells; clip to 3-150 before log10)."
+
+def get_tdc_revision_templates(task: str, species: str) -> tuple[str, ...]:
+    if species not in TDC_SPECIES_NAMES:
+        raise ValueError(f"Unsupported species: {species}")
+    if task == "tdc-ppbr_az":
+        return tuple(x.format(species=TDC_SPECIES_NAMES[species]) for x in _TDC_REVISION_PPBR)
+    if task == "tdc-clearance_hepatocyte_az":
+        return tuple((x + _TDC_REVISION_HEP_MEASUREMENT).format(species=TDC_SPECIES_NAMES[species]) for x in _TDC_REVISION_HEP)
+    raise ValueError(f"Unsupported revision task: {task}")
+
+
+import re
+from functools import lru_cache
+LEGACY_SYSTEM = 'You are a helpful assistant for molecular chemistry, to address tasks including molecular property classification, molecular property regression, chemical reaction prediction, molecule captioning, molecule generation.'
+SPECIES = TDC_SPECIES_NAMES
+species_templates = get_tdc_revision_templates
+TARGET_TASKS = {'tdc-ppbr_az', 'tdc-clearance_hepatocyte_az'}
+REVISION = 'tdc-species-nosystem-v1'
+
+def remove_legacy_system(prompt: str) -> tuple[str, int]:
+    match = re.match('((?:<s>)?\\[INST\\][ \\t]*)', prompt)
+    if not match:
+        return (prompt, 0)
+    start = match.end()
+    rest = prompt[start:]
+    count = 0
+    prefix = re.compile(re.escape(LEGACY_SYSTEM) + '[ \\t]*\\r?\\n[ \\t]*\\r?\\n[ \\t]*')
+    while True:
+        hit = prefix.match(rest)
+        if not hit:
+            break
+        rest = rest[hit.end():]
+        count += 1
+    if rest.startswith(LEGACY_SYSTEM):
+        raise ValueError('Known system boilerplate has an unrecognized separator')
+    return (prompt[:start] + rest, count)
+
+def chat_messages(user_prompt: str, mode: str='none') -> list[dict[str, str]]:
+    if mode not in {'none', 'legacy'}:
+        raise ValueError(f'Unknown system_prompt_mode: {mode}')
+    messages = [] if mode == 'none' else [{'role': 'system', 'content': LEGACY_SYSTEM}]
+    return messages + [{'role': 'user', 'content': user_prompt}]
+
+
+def validate_runtime_revision(revision: str | None, eval_molpo: bool, endpoint_matched_donors: bool=False) -> None:
+    if revision == REVISION and eval_molpo and (not endpoint_matched_donors):
+        raise ValueError('Species-aware GDR/MolPO evaluation needs rebuilt same-condition donors; this native prompt revision only supports eval_molpo=false')
+
+@lru_cache(maxsize=2)
+def _endpoint_templates(task):
+    compile_template = lambda text: re.compile(re.escape(text).replace(re.escape('<INPUT>'), '.+'), re.S)
+    revised = [(species, compile_template(template)) for species in SPECIES for template in species_templates(task, species)]
+    legacy = [compile_template(template) for template in TDC_TEMPLATES[task[4:]]]
+    return (revised, legacy)
+
+def tdc_prompt_endpoint(row):
+    task = row['task']
+    if task not in TARGET_TASKS:
+        return task
+    clean, _ = remove_legacy_system(row.get('prompt_text', ''))
+    wrapped = re.fullmatch('(?:<s>)?\\[INST\\] (.*) \\[/INST\\] ', clean, re.S)
+    query = wrapped[1] if wrapped else clean
+    revised, legacy = _endpoint_templates(task)
+    matches = {species for species, pattern in revised if pattern.fullmatch(query)}
+    if len(matches) == 1:
+        species = next(iter(matches))
+        measurement = 'plasma_binding_percent' if task == 'tdc-ppbr_az' else 'hepatocyte_37C_uL_min_1e6cells_clip3_150_log10'
+        return f'{task}/{REVISION}/{species}/{measurement}'
+    if not matches and any((pattern.fullmatch(query) for pattern in legacy)):
+        return task
+    raise ValueError(f'{task}: unrecognized/ambiguous species-measurement prompt; register its full template')

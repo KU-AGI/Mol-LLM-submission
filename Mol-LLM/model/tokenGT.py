@@ -112,6 +112,8 @@ class GraphFeatureTokenizer(torch.nn.Module):
         P_u = P[edge_index[0]]
         P_v = P[edge_index[1]]
         # Combine edge features with positional and type embeddings
+        if edge_attr.numel() == 0:
+            edge_attr = edge_attr.reshape(num_edges, self.edge_proj.in_features)
         edge_attr = self.edge_proj(edge_attr.float())
         X_e = torch.cat([edge_attr, P_u, P_v, E_E], dim=1)
         X_e_proj = self.w_in(X_e)

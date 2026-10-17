@@ -75,11 +75,21 @@ def main(cfg):
     )
 
     callbacks = []
+    if getattr(cfg, 'use_ema', False):
+        from model.ema import PreStepEMACallback
+        callbacks.append(PreStepEMACallback(
+            horizon_steps=cfg.ema_horizon_steps,
+            update_timing=getattr(cfg, "ema_update_timing", "before_optimizer_step"),
+            bias_correction=cfg.ema_bias_correction,
+            use_for_validation=True,
+            use_for_test=getattr(cfg, 'ema_for_test', False),
+        ))
     callbacks.append(
         ModelCheckpoint(
             dirpath=os.path.join(cfg.logging_dir, cfg.filename),
             filename="{epoch:02d}-{step}",
             every_n_epochs=cfg.every_n_epochs,
+            save_on_train_epoch_end=getattr(cfg, "save_on_train_epoch_end", None),
             save_last=True,
             save_top_k=-1,
         )
@@ -131,6 +141,7 @@ def main(cfg):
         "accumulate_grad_batches": cfg.accumulate_grad_batches,
         "log_every_n_steps": cfg.log_every_n_steps,
         "gradient_clip_val": cfg.gradient_clip_val,
+        "inference_mode": False,
     }
 
     if cfg.skip_sanity_check:
@@ -207,7 +218,7 @@ def flatten_dictconfig(config: DictConfig) -> DictConfig:
     items = []
     for k, v in config.items():
         new_key = k
-        if isinstance(v, DictConfig):
+        if k in ("trainer", "gnn", "data") and isinstance(v, DictConfig):
             for kk, vv in v.items():
                 items.append((f"{kk}", vv))
         else:

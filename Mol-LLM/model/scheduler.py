@@ -125,3 +125,29 @@ def step_lr_schedule(optimizer, epoch, init_lr, min_lr, decay_rate):
     lr = max(min_lr, init_lr * (decay_rate**epoch))
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
+
+
+class LinearWarmupConstantLRScheduler:
+
+    def __init__(self, optimizer, max_step, min_lr, init_lr, warmup_steps=0,
+                 warmup_start_lr=-1, **kwargs):
+        self.optimizer = optimizer
+        self.max_step = max_step
+        self.init_lr = init_lr
+        self.min_lr = min_lr
+        self.warmup_steps = warmup_steps
+        self.warmup_start_lr = warmup_start_lr if warmup_start_lr >= 0 else init_lr
+        assert self.warmup_steps < self.max_step, "warmup_steps should be less than max_step"
+
+    def step(self, cur_step):
+        if cur_step < self.warmup_steps:
+            warmup_lr_schedule(
+                step=cur_step,
+                optimizer=self.optimizer,
+                max_step=self.warmup_steps,
+                init_lr=self.warmup_start_lr,
+                max_lr=self.init_lr,
+            )
+        else:
+            for group in self.optimizer.param_groups:
+                group["lr"] = self.init_lr
